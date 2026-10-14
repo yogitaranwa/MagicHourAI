@@ -46,10 +46,32 @@ class MicrodramaEngine:
         model: str = DEFAULT_MODEL,
         resolution: str = DEFAULT_RESOLUTION,
         render_video: bool = True,
+        episode_number: int = 1,
+        previous_cliffhanger: Optional[str] = None,
+        previous_screenplay_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the complete microdrama generation pipeline."""
-        print("[1/5] Initializing template & character assets...")
+        print(f"[1/5] Initializing template & character assets (Episode {episode_number})...")
         template = get_template(template_id) if template_id else None
+
+        # Resolve previous episode cliffhanger if continuing a series
+        if previous_screenplay_path and Path(previous_screenplay_path).exists():
+            try:
+                import json
+                with open(previous_screenplay_path, "r", encoding="utf-8") as f:
+                    prev_data = json.load(f)
+                    if not previous_cliffhanger:
+                        previous_cliffhanger = prev_data.get("cliffhanger")
+                print(f"   Loaded Episode {episode_number - 1} cliffhanger: \"{previous_cliffhanger}\"")
+            except Exception as e:
+                print(f"[WARN] Could not parse previous screenplay: {e}")
+        elif episode_number > 1 and not previous_cliffhanger:
+            # Fallback to signature cliffhanger if continuing without file
+            if template and template.cliffhanger_formulas:
+                previous_cliffhanger = template.cliffhanger_formulas[0]
+            else:
+                previous_cliffhanger = "Protagonist corners the rival with shocking evidence."
+            print(f"   Auto-assigned Episode {episode_number - 1} cliffhanger: \"{previous_cliffhanger}\"")
         
         # Build cast with reference images attached
         cast: List[Character] = []
@@ -81,7 +103,7 @@ class MicrodramaEngine:
         # Upload reference images to Magic Hour
         cast = self.asset_manager.prepare_cast_references(cast)
 
-        print("[2/5] Writing high-stakes microdrama screenplay...")
+        print(f"[2/5] Writing high-stakes microdrama screenplay for Episode {episode_number}...")
         screenplay = self.screenwriter.generate_screenplay(
             story_idea=story_prompt,
             cast=cast,
@@ -90,6 +112,8 @@ class MicrodramaEngine:
             seconds_per_shot=seconds_per_shot,
             aspect_ratio="9:16",
             specific_scenes=specific_scenes,
+            episode_number=episode_number,
+            previous_cliffhanger=previous_cliffhanger,
         )
 
         print("[3/5] Evaluating script against DramaBench microdrama metrics...")
@@ -98,12 +122,19 @@ class MicrodramaEngine:
 
         print("[4/5] Generating zero-cost visual storyboard cards...")
         card_paths = self.storyboard_gen.render_full_storyboard(screenplay)
-        srt_path = OUTPUT_DIR / f"{screenplay.title.replace(' ', '_')}.srt"
+        clean_title = screenplay.title.replace(" ", "_").replace("'", "").replace(":", "")
+        srt_path = OUTPUT_DIR / f"{clean_title}.srt"
         SubtitleGenerator.generate_srt(screenplay, srt_path)
-        print(f"   Saved {len(card_paths)} storyboard cards and subtitle file: {srt_path.name}")
+
+        # Save screenplay JSON for automated series continuity & inspection
+        screenplay_json_path = OUTPUT_DIR / f"{clean_title}_screenplay.json"
+        with open(screenplay_json_path, "w", encoding="utf-8") as f:
+            f.write(screenplay.model_dump_json(indent=2))
+        print(f"   Saved {len(card_paths)} storyboard cards, subtitles ({srt_path.name}), and {screenplay_json_path.name}")
 
         result: Dict[str, Any] = {
             "screenplay": screenplay,
+            "screenplay_json": screenplay_json_path,
             "quality_score": score,
             "storyboard_cards": card_paths,
             "subtitles_srt": srt_path,

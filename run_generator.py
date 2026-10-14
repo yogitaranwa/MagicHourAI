@@ -86,6 +86,24 @@ def main():
         help="Specific LLM model to use (default: gemini-3.5-flash).",
     )
     parser.add_argument(
+        "--episode",
+        type=int,
+        default=1,
+        help="Episode number in the microdrama series (e.g. 1, 2, 3).",
+    )
+    parser.add_argument(
+        "--prev-screenplay",
+        type=str,
+        default=None,
+        help="Path to previous episode screenplay JSON to automatically pull cliffhanger & context.",
+    )
+    parser.add_argument(
+        "--prev-cliffhanger",
+        type=str,
+        default=None,
+        help="Custom previous cliffhanger description to resolve in Shot 1.",
+    )
+    parser.add_argument(
         "--storyboard-only",
         action="store_true",
         help="Generate screenplay and free 9:16 visual storyboard cards only (zero API video cost).",
@@ -102,12 +120,14 @@ def main():
     reference_images = {args.char_name: args.char_image} if args.char_image else None
 
     print("\n" + "=" * 60)
-    print("AI MICRO DRAMA GENERATOR")
+    print(f"AI MICRO DRAMA GENERATOR — EPISODE {args.episode}")
     print(f"* Template: {args.template}")
     print(f"* Shots: {args.shots} x {args.seconds}s (~{args.shots * args.seconds}s episode)")
     print(f"* Video Model: {args.model} ({args.resolution})")
     print(f"* LLM Writer: {args.provider} ({args.llm_model})")
     print(f"* Reference Image: {args.char_image or 'None'}")
+    if args.episode > 1:
+        print(f"* Series Continuity: Continuing from Episode {args.episode - 1}")
     print("=" * 60 + "\n")
 
     engine = MicrodramaEngine(
@@ -125,6 +145,9 @@ def main():
         model=args.model,
         resolution=args.resolution,
         render_video=not args.storyboard_only,
+        episode_number=args.episode,
+        previous_cliffhanger=args.prev_cliffhanger,
+        previous_screenplay_path=args.prev_screenplay,
     )
 
     screenplay = result["screenplay"]

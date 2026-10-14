@@ -1,6 +1,7 @@
-"""Magic Hour video generation pipeline with reference support and polling."""
+"""Magic Hour video generation pipeline with sequential clip generation and frame extraction."""
 
 import os
+import re
 import time
 import requests
 from pathlib import Path
@@ -8,12 +9,21 @@ from typing import Dict, Any, List, Optional
 from magic_hour import Client
 from ..config import MAGIC_HOUR_API_KEY, OUTPUT_DIR, VERTICAL_FRAMING_INSTRUCTION
 from ..models import Screenplay, Shot, Character
+from ..narrative.prompt_builder import build_sequential_shot_prompt
+from ..postprod.assembler import EpisodeAssembler
+from ..series.organizer import SeriesOrganizer
 from .journal import JobJournal
 from .asset_manager import AssetManager
 
 
+def slugify(text: str) -> str:
+    """Convert beat string into safe slug."""
+    cleaned = re.sub(r"[^\w\s-]", "", text).strip()
+    return re.sub(r"[-\s]+", "_", cleaned).lower() or "shot"
+
+
 class MagicHourGenerator:
-    """Manages video shot generation using Magic Hour API with character reference support."""
+    """Manages video shot generation using Magic Hour API with sequential frame extraction."""
 
     def __init__(
         self,
@@ -28,86 +38,151 @@ class MagicHourGenerator:
         self.asset_manager = AssetManager(magic_hour_client=self.client)
         self.clips_dir = OUTPUT_DIR / "clips"
         self.clips_dir.mkdir(parents=True, exist_ok=True)
+        self.assembler = EpisodeAssembler()
 
-    def build_shot_manifest(
+    def generate_episode_sequentially(
         self,
         screenplay: Screenplay,
+        organizer: SeriesOrganizer,
         model: str = "ltx-2.5",
         resolution: str = "480p",
         audio: bool = True,
-    ) -> List[Dict[str, Any]]:
-        """Construct Magic Hour API payloads for all shots in the screenplay."""
-        # Ensure reference images are uploaded
-        self.asset_manager.prepare_cast_references(screenplay.cast)
+        use_frame_extraction: bool = True,
+    ) -> List[Path]:
+        """Generate all 8 shots of an episode in strict sequence with last-frame continuity."""
+        ep_num = screenplay.episode_number
+        organizer.ensure_series_structure(episodes_count=max(10, ep_num))
+        
+        # Ensure character reference images are registered
+        if not self.mock_mode:
+            self.asset_manager.prepare_cast_references(screenplay.cast)
 
-        cast_bible = "; ".join(f"{c.name}: {c.look}" for c in screenplay.cast)
+        generated_clips: List[Path] = []
+        prev_shot: Optional[Shot] = None
+        last_frame_path: Optional[Path] = None
 
-        # Build reference items for text-to-video models supporting references
-        reference_items = []
-        for c in screenplay.cast:
-            if c.api_asset_path:
-                reference_items.append({"name": c.name, "file_path": c.api_asset_path})
+        print(f"[SERIES] Beginning sequential generation for Episode {ep_num} ({len(screenplay.shots)} shots)...")
 
-        manifest = []
-        for s in screenplay.shots:
-            dialogue_str = (
-                f"{s.speaker} says: \"{s.dialogue}\""
-                if (s.speaker and s.dialogue)
-                else "No spoken dialogue."
+        for idx, shot in enumerate(screenplay.shots):
+            beat_slug = slugify(shot.beat or f"beat_{idx+1}")
+            out_clip_path = organizer.get_shot_clip_path(ep_num, shot.id, beat_slug)
+            frame_path = organizer.get_last_frame_path(ep_num, shot.id)
+
+            # If clip already exists on disk and is a valid render (> 200KB for live API, > 1KB for mock)
+            min_clip_size = 200_000 if not self.mock_mode else 1000
+            if out_clip_path.exists() and out_clip_path.stat().st_size > min_clip_size:
+                print(f"[REUSE] Shot {shot.id} ({beat_slug}) already exists: {out_clip_path.name}")
+                generated_clips.append(out_clip_path)
+                if not frame_path.exists() and not self.mock_mode:
+                    self.assembler.extract_last_frame(out_clip_path, frame_path)
+                prev_shot = shot
+                last_frame_path = frame_path
+                continue
+
+            # Build context-aware prompt from previous shot
+            chained_prompt = build_sequential_shot_prompt(
+                shot=shot,
+                prev_shot=prev_shot,
+                screenplay=screenplay,
+                cast=screenplay.cast,
+                last_frame_path=str(last_frame_path) if (last_frame_path and last_frame_path.exists()) else None,
             )
 
-            prompt = (
-                f"{screenplay.genre} microdrama. {screenplay.vibe}. "
-                f"Cast: {cast_bible}. {s.visual}. Action: {s.action}. "
-                f"Camera: {s.camera}. Framing: {VERTICAL_FRAMING_INSTRUCTION} "
-                f"Continuity: {s.continuity}. {dialogue_str}. "
-                f"Sound: {s.audio}. No watermarks, subtitles or logos."
-            )
+            # Find primary speaker or leading character for reference anchoring
+            primary_char = None
+            if shot.speaker:
+                for c in screenplay.cast:
+                    if c.name.lower() == shot.speaker.lower():
+                        primary_char = c
+                        break
+            if not primary_char and screenplay.cast:
+                primary_char = screenplay.cast[0]
 
+            # Determine endpoint & start asset:
+            # - Shots 2-8: continue from extracted last frame of previous shot
+            # - Shot 1: seed from speaker/character reference image if available
+            is_i2v = False
+            start_asset = None
+            start_img_file = None
+
+            if not self.mock_mode:
+                if use_frame_extraction and idx > 0 and last_frame_path and last_frame_path.exists():
+                    is_i2v = True
+                    start_img_file = last_frame_path
+                    start_asset = self.asset_manager.upload_reference(last_frame_path)
+                elif primary_char and (primary_char.api_asset_path or primary_char.reference_image_path):
+                    is_i2v = True
+                    start_img_file = Path(primary_char.reference_image_path) if primary_char.reference_image_path else None
+                    start_asset = primary_char.api_asset_path or (self.asset_manager.upload_reference(primary_char.reference_image_path) if primary_char.reference_image_path else None)
+
+            endpoint = "image_to_video" if is_i2v and start_asset else "text_to_video"
             payload: Dict[str, Any] = {
-                "name": f"{screenplay.title.replace(' ', '_')}_{s.id}",
-                "style": {"prompt": prompt},
-                "end_seconds": float(s.duration),
+                "name": f"{organizer.series_slug}_ep{ep_num:02d}_{shot.id}",
+                "style": {"prompt": chained_prompt},
+                "end_seconds": float(shot.duration),
                 "resolution": resolution,
                 "model": model,
                 "audio": audio,
             }
 
-            if s.mode == "t2v":
-                payload["aspect_ratio"] = screenplay.aspect_ratio
-                if reference_items:
-                    payload["references"] = reference_items
-                endpoint = "text_to_video"
+            if endpoint == "image_to_video" and start_asset:
+                payload["assets"] = {"image_file_path": start_asset}
             else:
-                # Image-to-video mode
-                payload["assets"] = {"image_file_path": s.image_path}
-                endpoint = "image_to_video"
+                payload["aspect_ratio"] = screenplay.aspect_ratio
+                # Pass references if supported and available
+                ref_list = [
+                    {"name": c.name, "file_path": c.api_asset_path}
+                    for c in screenplay.cast
+                    if c.api_asset_path
+                ]
+                if ref_list and model in ("kling-3.0", "minimax-h3", "seedance-2.0", "wan-3.0"):
+                    payload["references"] = ref_list[:10]
 
-            item = {
-                "shot_id": s.id,
-                "mode": s.mode,
+            manifest_item = {
+                "shot_id": shot.id,
+                "mode": "i2v" if endpoint == "image_to_video" else "t2v",
                 "endpoint": endpoint,
                 "payload": payload,
+                "start_image_path": str(start_img_file) if start_img_file and Path(start_img_file).exists() else None,
             }
-            manifest.append(item)
 
-        return manifest
+            print(f"[SHOT] Rendering {shot.id} ({beat_slug}) via {endpoint.upper()}...")
+            clip_file = self.run_shot(manifest_item, target_path=out_clip_path)
+            generated_clips.append(clip_file)
 
-    def run_shot(self, manifest_item: Dict[str, Any], timeout: int = 1200) -> Path:
-        """Submit and poll a single shot, returning the downloaded clip Path."""
+            # Extract last frame for subsequent shot continuity
+            if not self.mock_mode and clip_file.exists():
+                try:
+                    self.assembler.extract_last_frame(clip_file, frame_path)
+                except Exception as e:
+                    print(f"[WARN] Frame extraction failed for {shot.id}: {e}")
+
+            prev_shot = shot
+            last_frame_path = frame_path
+
+        return generated_clips
+
+    def run_shot(
+        self,
+        manifest_item: Dict[str, Any],
+        target_path: Optional[Path] = None,
+        timeout: int = 1200,
+    ) -> Path:
+        """Submit and poll a single shot, downloading to specified target_path."""
         shot_id = manifest_item["shot_id"]
         payload = manifest_item["payload"]
         endpoint = manifest_item["endpoint"]
         tag = self.journal.compute_tag(payload)
-        out_clip = self.clips_dir / f"{shot_id}_{tag[:10]}.mp4"
+        out_clip = target_path or (self.clips_dir / f"{shot_id}_{tag[:10]}.mp4")
+        out_clip.parent.mkdir(parents=True, exist_ok=True)
 
-        # Check existing clip on disk
-        if out_clip.exists():
+        if out_clip.exists() and out_clip.stat().st_size > 1000:
             return out_clip
 
         if self.mock_mode:
-            print(f"[MOCK] Simulated generation for {shot_id}")
-            out_clip.write_text(f"Mock video for {shot_id}", encoding="utf-8")
+            # Generate valid lightweight mock video using FFmpeg
+            start_img = manifest_item.get("start_image_path")
+            self._generate_mock_clip(out_clip, duration=int(payload.get("end_seconds", 8)), image_path=start_img)
             return out_clip
 
         job_record = self.journal.get_job(tag)
@@ -160,6 +235,42 @@ class MagicHourGenerator:
             time.sleep(4)
 
         raise TimeoutError(f"Shot {shot_id} timed out after {timeout} seconds.")
+
+    def _generate_mock_clip(self, target_path: Path, duration: int = 8, image_path: Optional[str] = None) -> Path:
+        """Create a vertical 9:16 MP4 using local FFmpeg. If image_path exists, animates character image; else uses elegant test pattern."""
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        ffmpeg_bin = self.assembler.ffmpeg_bin
+        if ffmpeg_bin:
+            img = Path(image_path) if image_path else None
+            if img and img.is_file():
+                cmd = [
+                    "-loop", "1",
+                    "-i", str(img.resolve()),
+                    "-f", "lavfi",
+                    "-i", "anullsrc=r=48000:cl=stereo",
+                    "-t", str(duration),
+                    "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    str(target_path.resolve()),
+                ]
+            else:
+                cmd = [
+                    "-f", "lavfi",
+                    "-i", f"color=c=0x14141e:s=720x1280:d={duration}",
+                    "-f", "lavfi",
+                    "-i", f"anullsrc=r=48000:cl=stereo",
+                    "-t", str(duration),
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    str(target_path.resolve()),
+                ]
+            self.assembler.run_ffmpeg(cmd)
+        else:
+            target_path.write_bytes(b"MOCK_VIDEO_DATA")
+        return target_path
 
     def _download_file(self, url: str, target_path: Path) -> None:
         """Stream download to temporary file and atomically rename."""

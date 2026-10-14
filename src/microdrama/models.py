@@ -25,12 +25,14 @@ class Beat(BaseModel):
 
 class BeatSheet(BaseModel):
     """Outline plan for a microdrama episode before full scriptwriting."""
+    episode_number: int = Field(1, ge=1, description="Episode number in the series")
     title: str = Field("Untitled Microdrama", description="Episode title")
     genre: str = Field("Suspense", description="Genre of the drama")
     logline: str = Field(..., description="One-sentence hook and premise")
-    hook_promise: str = Field(..., description="What hooks the audience in the first 3 seconds")
-    cliffhanger_promise: str = Field(..., description="The unresolvable cliffhanger or shocking twist ending")
+    hook_promise: str = Field(..., description="What hooks the audience in the first 3 seconds (resolves prior cliffhanger if ep > 1)")
+    cliffhanger_promise: str = Field(..., description="The unresolvable cliffhanger or shocking twist ending for this episode")
     beats: List[Beat] = Field(..., description="Sequence of 4 to 12 dramatic beats")
+    previous_cliffhanger: Optional[str] = Field(None, description="Cliffhanger from previous episode that must be resolved")
 
 
 class Shot(BaseModel):
@@ -59,16 +61,29 @@ class Shot(BaseModel):
 
 class Screenplay(BaseModel):
     """Complete microdrama episode screenplay."""
+    episode_number: int = Field(1, ge=1, description="Episode number in the series")
     title: str = Field("Untitled Episode", description="Episode title")
     genre: str = Field("Suspense", description="Drama genre")
     vibe: str = Field("Tense, thrilling", description="Atmospheric vibe")
     language: str = Field("English", description="Spoken language")
     logline: str = Field("", description="Core premise summary")
-    hook: str = Field("", description="0-3s hook description")
+    hook: str = Field("", description="0-3s hook description (resolves prior cliffhanger if ep > 1)")
     cliffhanger: str = Field("", description="Episode ending cliffhanger description")
+    previous_cliffhanger: Optional[str] = Field(None, description="Previous episode cliffhanger resolved in shot 1")
+    series_context: Optional[str] = Field(None, description="Cumulative canon context from earlier episodes")
     cast: List[Character] = Field(..., min_length=1, max_length=4, description="1 to 4 main characters")
     shots: List[Shot] = Field(..., min_length=1, max_length=12, description="1 to 12 consecutive shots")
     aspect_ratio: str = Field("9:16", description="Video aspect ratio, default 9:16 vertical")
+
+
+class SeriesBible(BaseModel):
+    """Running series continuity tracker across multiple episodes."""
+    title: str = Field("Untitled Series", description="Series title")
+    template_id: str = Field("contract_marriage", description="Genre template ID")
+    cast: List[Character] = Field(default_factory=list, description="Canonical cast with persistent looks and assets")
+    episodes: List[Screenplay] = Field(default_factory=list, description="List of generated screenplays in sequence")
+    canon_events: List[str] = Field(default_factory=list, description="Running established facts and secrets revealed")
+    last_cliffhanger: str = Field("", description="Cliffhanger ending of the latest episode")
 
 
 class GenreTemplate(BaseModel):
